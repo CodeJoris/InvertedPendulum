@@ -89,8 +89,9 @@ def xdot(theta,thetadot):
 
 class App:
     size = WIDTH, HEIGHT
-    def __init__(self, pivot_body, mass_body):
+    def __init__(self, pivot_body, mass_body, plot_on=False):
         pygame.init()
+        self.plot_on = plot_on
         self.screen = pygame.display.set_mode(self.size, pygame.HIDDEN)
         self.draw_options = pymunk.pygame_util.DrawOptions(self.screen)
         self.running = True
@@ -100,7 +101,8 @@ class App:
         self.mass_body = mass_body
         self.prev_vx = self.pivot_body.velocity.x
         self.prev_th = np.arcsin((self.mass_body.position.x - self.pivot_body.position.x)/l)
-        self.live_plot = LivePlot(window_seconds=40.0)
+        if plot_on:
+            self.live_plot = LivePlot(window_seconds=40.0)
 
     def run(self):
         while self.running:
@@ -114,15 +116,17 @@ class App:
             space.step(self.dt)
 
             self.t += self.dt
-            th = np.arcsin((self.mass_body.position.x - self.pivot_body.position.x)/l)
-            th_dot = (th - self.prev_th) / self.dt
-            v_x = self.pivot_body.velocity.x
-            a_x = (v_x - self.prev_vx) / self.dt
-            self.prev_vx = v_x
-            self.prev_th = th
-            self.live_plot.update(self.t, v_x, a_x, th, th_dot)
+            if self.plot_on:
+                th = np.arcsin((self.mass_body.position.x - self.pivot_body.position.x)/l)
+                th_dot = (th - self.prev_th) / self.dt
+                v_x = self.pivot_body.velocity.x
+                a_x = (v_x - self.prev_vx) / self.dt
+                self.prev_vx = v_x
+                self.prev_th = th
+                self.live_plot.update(self.t, v_x, a_x, th, th_dot)
 
-        self.live_plot.close()
+        if self.plot_on:
+            self.live_plot.close()
         pygame.quit()
 
 if __name__ == '__main__':
