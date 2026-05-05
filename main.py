@@ -5,6 +5,7 @@ from collections import deque
 import numpy as np
 
 import matplotlib.pyplot as plt
+from scipy.optimize import minimize
 
 GRAY = (220, 220, 220)
 CONTROL_BG = (35, 35, 35)
@@ -13,6 +14,7 @@ TRACK_FG = (120, 180, 255)
 KNOB = (240, 240, 240)
 WHITE = (245, 245, 245)
 ENABLE_LIVE_PLOTS = False
+ENABLE_OPTIMIZATION = True  # Set to True to run PID optimization before interactive mode
 space = pymunk.Space()
 space.gravity = 0, 9
 b0 = space.static_body
@@ -20,7 +22,9 @@ WIDTH, HEIGHT = 1000, 600
 CONTROL_HEIGHT = 180
 l = 100  # length of the pendulum
 m = 1  # mass of the mass at the end of pendulum
-M = 1000  # mass of the pivot (cart)
+M = 10  # mass of the pivot (cart) - reduced from 1000 for better responsiveness
+FORCE_LIMIT = 10000  # increased from 6000 for stronger control
+WALL_MARGIN = 50  # distance from boundary to trigger wall correction (pixels)
 
 
 class Slider:
@@ -138,6 +142,111 @@ def xdot(theta, thetadot):
     return -((2 * l) / (M + m)) * thetadot * np.cos(theta)
 
 
+def simulate_pid(kp, ki, kd, duration=20.0, dt=5/60):
+    """
+    Simulate the system with given PID parameters and return cumulative loss.
+    Loss = integral of (theta^2 + 0.001 * control_effort^2) over simulation time.
+    """
+    # Create fresh simulation state
+    test_space = pymunk.Space()
+    test_space.gravity = 0, 9
+    test_b0 = test_space.static_body
+    
+    test_body = pymunk.Body(mass=m, moment=10)
+    test_body.position = (WIDTH / 2 , HEIGHT / 2)
+    test_circle = pymunk.Circle(test_body, radius=20)
+    
+    # Make pivot kinematic so it's unaffected by the swinging mass
+    test_pivot = pymunk.Body(body_type=pymunk.Body.KINEMATIC)
+    test_pivot.position = WIDTH / 2, HEIGHT / 2
+    
+    test_joint = pymunk.PinJoint(test_pivot, test_body, (0, 0), (0, 0))
+    test_space.add(test_pivot, test_body, test_circle, test_joint)
+    
+    # Run simulation
+    t = 0.0
+    integral_error = 0.0
+    cumulative_loss = 0.0
+    prev_th = 0.0
+    target_theta = 0.0
+    
+    steps = int(duration / dt)
+    for step in range(steps):
+        # Compute theta as angle from upward vertical
+        dx = test_body.position.x - test_pivot.position.x
+        dy = test_body.position.y - test_pivot.position.y
+        theta = np.arctan2(dx, -dy)  # angle from upward vertical, counterclockwise positive
+        theta_dot = (theta - prev_th) / dt
+        
+        # PID control
+        error = target_theta - theta
+        integral_error = float(np.clip(integral_error + error * dt, -4.0, 4.0))
+        acceleration = kp * error + ki * integral_error - kd * theta_dot
+        
+        # Wall collision prevention
+        cart_x = test_pivot.position.x
+        if cart_x < WALL_MARGIN:
+            acceleration = max(acceleration, 20)
+        elif cart_x > WIDTH - WALL_MARGIN:
+            acceleration = min(acceleration, -20)
+        
+        acceleration = float(np.clip(acceleration, -FORCE_LIMIT, FORCE_LIMIT))
+        
+        # Set kinematic body velocity based on acceleration
+        test_pivot.velocity = (acceleration * dt, 0.0)
+        
+        # Accumulate loss: penalize deviation from upright and control effort
+        cumulative_loss += (theta**2 + 0.001 * (acceleration / FORCE_LIMIT)**2) * dt
+        
+        # Step physics
+        test_space.step(dt)
+        prev_th = theta
+        t += dt
+    
+    return cumulative_loss
+
+
+def optimize_pid(initial_kp=1.0, initial_ki=0.0, initial_kd=0.0, duration=50.0):
+    """
+    Find optimal PID parameters using scipy.optimize.minimize.
+    
+    Args:
+        initial_kp, initial_ki, initial_kd: Initial guesses for gains
+        duration: Simulation duration per evaluation (seconds)
+    
+    Returns:
+        (kp, ki, kd): Optimal parameter values
+    """
+    print("Starting PID optimization...")
+    print(f"Initial guess: Kp={initial_kp:.3f}, Ki={initial_ki:.3f}, Kd={initial_kd:.3f}")
+    
+    def objective(gains):
+        kp, ki, kd = gains
+        loss = simulate_pid(kp, ki, kd, duration=duration)
+        print(f"  Evaluating: Kp={kp:.3f}, Ki={ki:.3f}, Kd={kd:.3f}  Loss={loss:.4f}")
+        return loss
+    
+    # Define bounds for gains
+    bounds = [(-1000.0, 1000.0), (-10.0, 10.0), (-500.0, 500.0)]  # Kp, Ki, Kd
+    
+    # Run optimization
+    result = minimize(
+        objective,
+        x0=[initial_kp, initial_ki, initial_kd],
+        method='L-BFGS-B',
+        bounds=bounds,
+        options={'ftol': 1e-5, 'maxiter': 50}
+    )
+    
+    kp_opt, ki_opt, kd_opt = result.x
+    print(f"\nOptimization complete!")
+    print(f"Optimal parameters: Kp={kp_opt:.3f}, Ki={ki_opt:.3f}, Kd={kd_opt:.3f}")
+    print(f"Final loss: {result.fun:.4f}\n")
+    
+    return kp_opt, ki_opt, kd_opt
+
+
+
 class App:
     size = WIDTH, HEIGHT + CONTROL_HEIGHT
 
@@ -159,9 +268,9 @@ class App:
         self.font = pygame.font.SysFont("arial", 16)
         self.live_plot = LivePlot(window_seconds=40.0) if ENABLE_LIVE_PLOTS else None
         self.sliders = [
-            Slider(20, HEIGHT + 45, WIDTH - 20, "P", -200.0, 200.0, 1.0),
-            Slider(20, HEIGHT + 100, WIDTH - 20, "I", -1.0, 1.0, 0.0),
-            Slider(20, HEIGHT + 155, WIDTH - 20, "D", -50.0, 50.0, 0.0),
+            Slider(20, HEIGHT + 45, WIDTH - 20, "P", -200.0, 200.0, 50.0),
+            Slider(20, HEIGHT + 100, WIDTH - 20, "I", -1.0, 1.0, 0.1),
+            Slider(20, HEIGHT + 155, WIDTH - 20, "D", -50.0, 50.0, 20.0),
         ]
 
     def force_from_error(self, theta, theta_dot):
@@ -170,8 +279,18 @@ class App:
         kp = self.sliders[0].value
         ki = self.sliders[1].value
         kd = self.sliders[2].value
-        force = kp * error + ki * self.integral_error - kd * theta_dot
-        return float(np.clip(force, -6000.0, 6000.0))
+        acceleration = kp * error + ki * self.integral_error - kd * theta_dot
+        
+        # Wall collision prevention: apply corrective force if cart is near boundaries
+        cart_x = self.pivot_body.position.x
+        if cart_x < WALL_MARGIN:
+            # Too close to left wall, push right
+            acceleration = max(acceleration, 20)
+        elif cart_x > WIDTH - WALL_MARGIN:
+            # Too close to right wall, push left
+            acceleration = min(acceleration, -20)
+        
+        return float(np.clip(acceleration, -FORCE_LIMIT, FORCE_LIMIT))
 
     def run(self):
         while self.running:
@@ -185,14 +304,17 @@ class App:
             space.debug_draw(self.draw_options)
             pygame.draw.rect(self.screen, CONTROL_BG, (0, HEIGHT, WIDTH, CONTROL_HEIGHT))
 
-            ratio = (self.mass_body.position.x - self.pivot_body.position.x) / l
-            theta = np.arcsin(np.clip(ratio, -1.0, 1.0))
+            # Compute theta as angle from upward vertical
+            dx = self.mass_body.position.x - self.pivot_body.position.x
+            dy = self.mass_body.position.y - self.pivot_body.position.y
+            theta = np.arctan2(dx, -dy)  # angle from upward vertical, counterclockwise positive
             theta_dot = (theta - self.prev_th) / self.dt
-            force_x = self.force_from_error(theta, theta_dot)
-            self.pivot_body.apply_force_at_world_point((M * force_x, 0.0), self.pivot_body.position)
+            accel_x = self.force_from_error(theta, theta_dot)
+            # Set kinematic pivot velocity based on acceleration
+            self.pivot_body.velocity = (accel_x * self.dt, 0.0)
 
             pygame.draw.rect(self.screen, (15, 15, 15), (0, HEIGHT, WIDTH, 24))
-            status_surface = self.font.render(f"theta={theta:.3f}  theta_dot={theta_dot:.3f}  force={force_x:.1f}", True, WHITE)
+            status_surface = self.font.render(f"theta={theta:.3f}  theta_dot={theta_dot:.3f}  accel={accel_x:.1f}", True, WHITE)
             self.screen.blit(status_surface, (12, HEIGHT + 2))
 
             for slider in self.sliders:
@@ -219,13 +341,21 @@ body = pymunk.Body(mass=m, moment=10)
 body.position = (WIDTH / 2 - 100, HEIGHT / 2)
 circle = pymunk.Circle(body, radius=20)
 
-pivot = pymunk.Body(mass=M, moment=float('inf'))
+# Make pivot kinematic so it's unaffected by the swinging mass
+pivot = pymunk.Body(body_type=pymunk.Body.KINEMATIC)
 pivot.position = WIDTH / 2, HEIGHT / 2
 
-groove = pymunk.GrooveJoint(b0, pivot, (0, HEIGHT / 2), (WIDTH, HEIGHT / 2), (0, 0))
-groove.collide_bodies = False
-
 joint = pymunk.PinJoint(pivot, body, (0, 0), (0, 0))
-space.add(pivot, body, circle, groove, joint)
+space.add(pivot, body, circle, joint)
 
-App(pivot, body).run()
+# Run optimization if enabled
+app = App(pivot, body)
+if ENABLE_OPTIMIZATION:
+    kp_opt, ki_opt, kd_opt = optimize_pid(initial_kp=1.0, initial_ki=0.0, initial_kd=0.0, duration=500.0)
+    # Load optimized values into sliders
+    app.sliders[0].value = kp_opt
+    app.sliders[1].value = ki_opt
+    app.sliders[2].value = kd_opt
+    print("Sliders updated with optimized parameters. Ready to run simulation.\n")
+
+app.run()

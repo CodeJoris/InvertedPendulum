@@ -1,0 +1,199 @@
+import pygame
+import sys
+import pymunk
+import pymunk.pygame_util
+import numpy as np
+from control import get_K, get_energy, get_target_energy
+
+# initialize the game window
+pygame.init()
+WIDTH, HEIGHT = 800, 600
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+clock = pygame.time.Clock()
+FPS = 60
+
+# Pymunk setup
+space = pymunk.Space()
+space.gravity = (0.0, 10.0) # px/s^2
+draw_options = pymunk.pygame_util.DrawOptions(screen)
+
+# Game state
+running = True
+
+# Physical Parameters
+M = 1.0     # kg
+m = 0.15    # kg
+l = 100     # pixels
+g = 100      # pixels/s^2
+
+# initial conditions (radians, rad/s)
+x0 = last_x = WIDTH // 2
+vx0 = 0
+theta0 = np.pi-0.15
+last_theta = ( theta0 + 2 * np.pi ) % ( 2 * np.pi )
+omega0 = 0
+
+# compute bob offset so theta=0 means bob is directly above cart
+rx = l * np.sin(theta0)
+ry = - l * np.cos(theta0)          # negative = above cart
+
+# Define the cart
+cart_w, cart_h = 120, 30
+cart_y = HEIGHT // 2
+cart = pymunk.Body(M, float('inf'))
+cart.position = (x0, cart_y)
+cart.velocity = (vx0,0)
+cart_shape = pymunk.Poly.create_box(cart, (cart_w, cart_h))
+
+# Constraint the cart to move horizontally
+groove = pymunk.GrooveJoint(space.static_body, cart, (50, cart_y), (WIDTH - 50, cart_y), (0,0))
+groove.collide_bodies = False
+
+# Define the pendulum mass
+radius = 15
+moment = pymunk.moment_for_circle(m,0,radius)
+mass = pymunk.Body(m, moment)
+mass.position = cart.position + pymunk.Vec2d(-rx, ry)
+mass_shape = pymunk.Circle(mass, radius)
+
+# choose joint anchors so the pin connects cart center to bob center:
+# (this is the simplest: both anchors at (0,0) local coordinates)
+pin = pymunk.PinJoint(cart, mass, (0, 0), (0, 0))
+
+# set bob linear velocity corresponding to angular velocity about the cart:
+# v = omega x r  =>  v = (-omega * ry, omega * rx)
+mass.velocity = cart.velocity + pymunk.Vec2d(-omega0 * ry, omega0 * rx)
+
+space.add(cart, cart_shape, groove, mass, mass_shape, pin)
+
+font = pygame.font.SysFont("Arial", 18)
+
+# Get the K matrix from the control module
+K = get_K(M, m, l, g)
+
+target_energy = get_target_energy(m, l, g)
+
+# Controller UI state
+controller_enabled = True
+button_rect = pygame.Rect(WIDTH - 170, 10, 160, 34)
+BUTTON_ON_COLOR = (50, 200, 50)
+BUTTON_OFF_COLOR = (200, 50, 50)
+BUTTON_TEXT_COLOR = (255, 255, 255)
+CLIP_MAX = 5000.0
+
+
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+        # mouse click toggles controller when clicking the button
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if button_rect.collidepoint(event.pos):
+                controller_enabled = not controller_enabled
+        # keyboard toggle
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_c:
+                controller_enabled = not controller_enabled
+    
+    # Physics
+    dt = 1 / FPS
+    space.step(dt)
+
+    # compute pendulum angle theta (0 = upright)
+    dx = cart.position.x - mass.position.x 
+    dy = cart.position.y - mass.position.y
+    theta = ( np.arctan2(dx, dy) )# angle measured from upward vertical (radians)
+    # theta_continuous = ( theta + 2 * np.pi ) % ( 2 * np.pi )# angle measured from upward vertical (radians)
+
+    # Compute linear and angular velocities
+    omega = (theta - last_theta) / dt
+    v = (cart.position.x - last_x) / dt
+
+    last_x = cart.position.x
+    last_theta = theta
+
+    # Define the state vector with numerical values
+    x = np.array([cart.position.x - (WIDTH//2), v, theta, omega])
+
+    # print(x)
+
+    # Compute the force F = - K . x (K matrix and state vector evaluated) and apply it on the cart
+    if abs(theta) < 0.26:
+        F = - np.dot(K,x)
+        F = F[0]
+        print("Linear regime")
+        # print(F)
+    else:
+        current_energy = get_energy(cart.position.x, v, theta, omega, M, m, l, g)
+        E_err = current_energy - target_energy
+
+        # Define hardware limits
+        max_motor_force = 50.0  # The max force your steppers can handle without skipping
+        energy_threshold = 0.5  # How close to E_target before we ease off the throttle
+
+        # Calculate the raw pumping direction
+        pump_direction = np.sign(E_err * omega * np.cos(theta))
+
+        # Choose the Pumping Strategy based on current energy error
+        if abs(E_err) > energy_threshold:
+            # BANG-BANG MODE: We are far from the top. Pump with max safe force!
+            F = max_motor_force * pump_direction
+        else:
+            # PROPORTIONAL MODE: We are getting close. Ease off and finesse it.
+            # (Tune k_E so the transition from max_motor_force is smooth)
+            k_E = 2.0 
+            print(1)
+            F = k_E * E_err * omega * np.cos(theta)
+
+        # Tune these three numbers based on your physical track length
+        k_p = 2.0  # Virtual spring stiffness (pulls back to x=0)
+        k_d = 5.0  # Virtual damping (prevents cart jitter)
+        # print(E_err)
+
+        F_ideal = F - (k_p * x) - (k_d * v)
+
+        F = np.clip(F_ideal, -max_motor_force, max_motor_force)
+
+        # energy = k_E * E_err * omega * np.cos(theta)
+        # spring = - (k_p * (cart.position.x - (WIDTH//2)))
+        # damping = - (k_d * v)  
+
+        # F = energy + spring + damping    
+        # print(energy, spring, damping)
+
+        
+        # print(F)
+
+    # Ensure F is a scalar and clip to a safe maximum
+    try:
+        F = float(F)
+    except Exception:
+        F = float(np.array(F).flatten()[0])
+
+    # Apply force only when controller is enabled
+    if controller_enabled:
+        cart.apply_force_at_world_point((F, 0), cart.position)
+
+
+
+    # --- draw ---
+    screen.fill((255, 255, 255))
+    space.debug_draw(draw_options)
+
+    # Draw controller toggle button
+    btn_color = BUTTON_ON_COLOR if controller_enabled else BUTTON_OFF_COLOR
+    pygame.draw.rect(screen, btn_color, button_rect, border_radius=6)
+    label = "Controller: ON" if controller_enabled else "Controller: OFF"
+    label_surf = font.render(label, True, BUTTON_TEXT_COLOR)
+    screen.blit(label_surf, (button_rect.x + 10, button_rect.y + 6))
+
+    info = f"cart_x={cart.position.x:.1f} cart_v={v:.1f} theta={theta:.3f} rad omega={omega:.3f} force={F:.3f}"
+    screen.blit(font.render(info, True, (220,220,220)), (8,8))
+
+    pygame.display.flip()
+    # clock.tick(FPS)
+
+pygame.quit()
+sys.exit()
+
+    
