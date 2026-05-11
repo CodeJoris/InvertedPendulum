@@ -4,13 +4,14 @@ import pymunk
 import pymunk.pygame_util
 import numpy as np
 from control import get_K, get_energy, get_target_energy
+from filters import EWMA, MedianFitler, MovingAverage
 
 # initialize the game window
 pygame.init()
 WIDTH, HEIGHT = 800, 600
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 clock = pygame.time.Clock()
-FPS = 60
+FPS = 150
 
 # Pymunk setup
 space = pymunk.Space()
@@ -63,15 +64,26 @@ pin = pymunk.PinJoint(cart, mass, (0, 0), (0, 0))
 # set bob linear velocity corresponding to angular velocity about the cart:
 # v = omega x r  =>  v = (-omega * ry, omega * rx)
 mass.velocity = cart.velocity + pymunk.Vec2d(-omega0 * ry, omega0 * rx)
-
 space.add(cart, cart_shape, groove, mass, mass_shape, pin)
-
 font = pygame.font.SysFont("Arial", 18)
 
 # Get the K matrix from the control module
 K = get_K(M, m, l, g)
-
 target_energy = get_target_energy(m, l, g)
+
+# Define Deadzone +-5degs from the linear regime limit to avoid fast switching
+linear_regime = np.deg2rad(15)
+linear = False
+energy = True
+if abs(theta0) < linear_regime:
+    linear = True
+    energy = False
+
+
+# Instanciate the filters
+spike_killer = MedianFitler(window_size=5)
+smoother = EWMA(alpha=0.05) # closer to 0 gives more weight to old values
+force_arr = list()
 
 # Controller UI state
 controller_enabled = True
@@ -116,20 +128,21 @@ while running:
     x = np.array([cart.position.x - (WIDTH//2), v, theta, omega])
 
     # print(x)
+    # Define hardware limits
+    max_motor_force = 50.0  # The max force your steppers can handle without skipping
+    energy_threshold = 500  # How close to E_target before we ease off the throttle
 
     # Compute the force F = - K . x (K matrix and state vector evaluated) and apply it on the cart
-    if abs(theta) < 0.26:
+    if abs(theta) < linear_regime:
+        linear = True
         F = - np.dot(K,x)
         F = F[0]
-        print("Linear regime")
+        # print("Linear regime")
         # print(F)
     else:
         current_energy = get_energy(cart.position.x, v, theta, omega, M, m, l, g)
         E_err = current_energy - target_energy
-
-        # Define hardware limits
-        max_motor_force = 50.0  # The max force your steppers can handle without skipping
-        energy_threshold = 0.5  # How close to E_target before we ease off the throttle
+        # print(current_energy, target_energy, E_err)
 
         # Calculate the raw pumping direction
         pump_direction = np.sign(E_err * omega * np.cos(theta))
@@ -141,18 +154,18 @@ while running:
         else:
             # PROPORTIONAL MODE: We are getting close. Ease off and finesse it.
             # (Tune k_E so the transition from max_motor_force is smooth)
-            k_E = 2.0 
-            print(1)
+            k_E = 0.01 
+            # print(1)
             F = k_E * E_err * omega * np.cos(theta)
 
         # Tune these three numbers based on your physical track length
         k_p = 2.0  # Virtual spring stiffness (pulls back to x=0)
-        k_d = 5.0  # Virtual damping (prevents cart jitter)
+        k_d = 10.0  # Virtual damping (prevents cart jitter)
         # print(E_err)
 
-        F_ideal = F - (k_p * x) - (k_d * v)
+        F = F - (k_p * x) - (k_d * v)
 
-        F = np.clip(F_ideal, -max_motor_force, max_motor_force)
+        
 
         # energy = k_E * E_err * omega * np.cos(theta)
         # spring = - (k_p * (cart.position.x - (WIDTH//2)))
@@ -169,6 +182,10 @@ while running:
         F = float(F)
     except Exception:
         F = float(np.array(F).flatten()[0])
+
+    F = np.clip(F, -max_motor_force, max_motor_force)
+    F = smoother.apply(spike_killer.apply(F))
+    force_arr.append(F)
 
     # Apply force only when controller is enabled
     if controller_enabled:
@@ -191,9 +208,17 @@ while running:
     screen.blit(font.render(info, True, (220,220,220)), (8,8))
 
     pygame.display.flip()
-    # clock.tick(FPS)
+    # clock.tick(60)
 
 pygame.quit()
-sys.exit()
 
+import matplotlib.pyplot as plt
+frames = np.arange(0,len(force_arr))
+force_arr = np.array(force_arr)
+plt.plot(frames, force_arr)
+plt.xlabel("Frame number")
+plt.ylabel("Force (N)")
+plt.grid(True)
+plt.show()
     
+sys.exit()
