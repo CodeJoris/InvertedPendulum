@@ -3,7 +3,7 @@ import sys
 import pymunk
 import pymunk.pygame_util
 import numpy as np
-from control import get_K, get_energy, get_target_energy
+from control import get_K, get_energy, get_target_energy, calc_F_LQR, calc_F_swing
 from filters import EWMA, MedianFitler, MovingAverage
 
 # initialize the game window
@@ -71,6 +71,10 @@ font = pygame.font.SysFont("Arial", 18)
 K = get_K(M, m, l, g)
 target_energy = get_target_energy(m, l, g)
 
+# Define hardware limits
+max_motor_force = 50.0  # The max force your steppers can handle without skipping
+energy_threshold = 500  # How close to E_target before we ease off the throttle
+
 # Define Deadzone +-5degs from the linear regime limit to avoid fast switching
 linear_regime = np.deg2rad(15)
 linear = False
@@ -78,6 +82,33 @@ energy = True
 if abs(theta0) < linear_regime:
     linear = True
     energy = False
+
+# Blending mechanic for the handoff from swing up to LQR controll
+time = 1e-3 # 100ms
+frames = time * FPS # s * frames / s --> frames
+w = 0.5 # blending variable [0,1]
+
+def get_blended_force(theta, u_swing, u_lqr):
+    # Define your window (in radians)
+    # e.g., 20 degrees for the outer edge, 5 degrees for full LQR
+    outer_limit = np.deg2rad(20)  # ~20 degrees
+    inner_limit = np.deg2rad(5)  # ~5 degrees
+    
+    abs_theta = abs(theta)
+
+    if abs_theta > outer_limit:
+        # Too far away, just swing up
+        w = 0.0
+    elif abs_theta < inner_limit:
+        # Close enough, full LQR
+        w = 1.0
+    else:
+        # Linear interpolation between the two
+        # (outer - current) / (outer - inner)
+        w = (outer_limit - abs_theta) / (outer_limit - inner_limit)
+
+    # The final control law
+    return (1 - w) * u_swing + w * u_lqr
 
 
 # Instanciate the filters
@@ -128,54 +159,15 @@ while running:
     x = np.array([cart.position.x - (WIDTH//2), v, theta, omega])
 
     # print(x)
-    # Define hardware limits
-    max_motor_force = 50.0  # The max force your steppers can handle without skipping
-    energy_threshold = 500  # How close to E_target before we ease off the throttle
+    current_energy = get_energy(cart.position.x, v, theta, omega, M, m, l, g)
+
 
     # Compute the force F = - K . x (K matrix and state vector evaluated) and apply it on the cart
     if abs(theta) < linear_regime:
-        linear = True
-        F = - np.dot(K,x)
-        F = F[0]
-        # print("Linear regime")
-        # print(F)
+        F = calc_F_LQR(K, x)
+
     else:
-        current_energy = get_energy(cart.position.x, v, theta, omega, M, m, l, g)
-        E_err = current_energy - target_energy
-        # print(current_energy, target_energy, E_err)
-
-        # Calculate the raw pumping direction
-        pump_direction = np.sign(E_err * omega * np.cos(theta))
-
-        # Choose the Pumping Strategy based on current energy error
-        if abs(E_err) > energy_threshold:
-            # BANG-BANG MODE: We are far from the top. Pump with max safe force!
-            F = max_motor_force * pump_direction
-        else:
-            # PROPORTIONAL MODE: We are getting close. Ease off and finesse it.
-            # (Tune k_E so the transition from max_motor_force is smooth)
-            k_E = 0.01 
-            # print(1)
-            F = k_E * E_err * omega * np.cos(theta)
-
-        # Tune these three numbers based on your physical track length
-        k_p = 2.0  # Virtual spring stiffness (pulls back to x=0)
-        k_d = 10.0  # Virtual damping (prevents cart jitter)
-        # print(E_err)
-
-        F = F - (k_p * x) - (k_d * v)
-
-        
-
-        # energy = k_E * E_err * omega * np.cos(theta)
-        # spring = - (k_p * (cart.position.x - (WIDTH//2)))
-        # damping = - (k_d * v)  
-
-        # F = energy + spring + damping    
-        # print(energy, spring, damping)
-
-        
-        # print(F)
+        F = calc_F_swing(target_energy, current_energy, x, v, theta, omega, max_motor_force, energy_threshold)
 
     # Ensure F is a scalar and clip to a safe maximum
     try:
@@ -184,6 +176,7 @@ while running:
         F = float(np.array(F).flatten()[0])
 
     F = np.clip(F, -max_motor_force, max_motor_force)
+    F = get_blended_force(theta, calc_F_swing(target_energy, current_energy, x, v, theta, omega, max_motor_force, energy_threshold), calc_F_LQR(K, x))
     F = smoother.apply(spike_killer.apply(F))
     force_arr.append(F)
 

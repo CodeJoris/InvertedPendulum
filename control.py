@@ -164,3 +164,32 @@ def get_K(M, m, l, g):
 # K = get_K(M, m, l, g)
 # force = - K @ state
 # print(force)
+
+def calc_F_LQR(K, x):
+    F = - np.dot(K,x)
+    F = F[0]
+
+def calc_F_swing(target_energy, current_energy, x, v, theta, omega, max_motor_force = 50.0, energy_threshold = 500):
+    E_err = current_energy - target_energy
+    # print(current_energy, target_energy, E_err)
+
+    # Calculate the raw pumping direction
+    pump_direction = np.sign(E_err * omega * np.cos(theta))
+
+    # Choose the Pumping Strategy based on current energy error
+    if abs(E_err) > energy_threshold:
+        # BANG-BANG MODE: We are far from the top. Pump with max safe force!
+        F = max_motor_force * pump_direction
+    else:
+        # PROPORTIONAL MODE: We are getting close. Ease off and finesse it.
+        # (Tune k_E so the transition from max_motor_force is smooth)
+        k_E = 0.01 
+        # print(1)
+        F = k_E * E_err * omega * np.cos(theta)
+
+    # Tune these three numbers based on your physical track length
+    k_p = 2.0  # Virtual spring stiffness (pulls back to x=0)
+    k_d = 10.0  # Virtual damping (prevents cart jitter)
+    # print(E_err)
+
+    F = F - (k_p * x) - (k_d * v)
