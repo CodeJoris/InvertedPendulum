@@ -122,9 +122,6 @@ def get_target_energy(m, g, l):
     return m * g * l
 
 def get_energy(x_cart, v_cart, theta_pendulum, omega_pendulum, m_cart, m_mass, length, gravity):
-    E = T + V
-    # Sub the passed in values into E (it has some x.diff(t) object in there right now)
-    
     # return E.subs({x:x_cart,x_dot:v_cart,theta:theta_pendulum, theta_dot:omega_pendulum, M:m_cart, m:m_mass, l:length, g:gravity})
     return 0.5 * m_mass * (length**2) * (omega_pendulum**2) + m_mass * gravity * length * np.cos(theta_pendulum)
     
@@ -167,7 +164,8 @@ def get_K(M, m, l, g):
 
 def calc_F_LQR(K, x):
     F = - np.dot(K,x)
-    F = F[0]
+    # print("LQR",float(np.array(F).flatten()[0]))
+    return float(np.array(F).flatten()[0])
 
 def calc_F_swing(target_energy, current_energy, x, v, theta, omega, max_motor_force = 50.0, energy_threshold = 500):
     E_err = current_energy - target_energy
@@ -183,13 +181,14 @@ def calc_F_swing(target_energy, current_energy, x, v, theta, omega, max_motor_fo
     else:
         # PROPORTIONAL MODE: We are getting close. Ease off and finesse it.
         # (Tune k_E so the transition from max_motor_force is smooth)
-        k_E = 0.01 
+        k_E = 1.0 
         # print(1)
         F = k_E * E_err * omega * np.cos(theta)
 
     # Tune these three numbers based on your physical track length
     k_p = 2.0  # Virtual spring stiffness (pulls back to x=0)
-    k_d = 10.0  # Virtual damping (prevents cart jitter)
+    k_d = 5.0  # Virtual damping (prevents cart jitter)
     # print(E_err)
+    # print("swing",F)
 
-    F = F - (k_p * x) - (k_d * v)
+    return F - (k_p * x) - (k_d * v)

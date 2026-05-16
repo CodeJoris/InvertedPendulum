@@ -3,7 +3,7 @@ import sys
 import pymunk
 import pymunk.pygame_util
 import numpy as np
-from control import get_K, get_energy, get_target_energy, calc_F_LQR, calc_F_swing
+from control import get_K, get_energy, get_target_energy
 from filters import EWMA, MedianFitler, MovingAverage
 
 # initialize the game window
@@ -11,11 +11,11 @@ pygame.init()
 WIDTH, HEIGHT = 800, 600
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 clock = pygame.time.Clock()
-FPS = 300
+FPS = 150
 
 # Pymunk setup
 space = pymunk.Space()
-space.gravity = (0.0, 100.0) # px/s^2
+space.gravity = (0.0, 10.0) # px/s^2
 draw_options = pymunk.pygame_util.DrawOptions(screen)
 
 # Game state
@@ -30,12 +30,9 @@ g = 100      # pixels/s^2
 # initial conditions (radians, rad/s)
 x0 = last_x = WIDTH // 2
 vx0 = 0
-theta0 = np.pi - 0.15
-last_theta = theta0
-last_cont_theta = theta0
-cummulative_correction = 0
+theta0 = np.pi-0.15
+last_theta = ( theta0 + 2 * np.pi ) % ( 2 * np.pi )
 omega0 = 0
-arr = list()
 
 # compute bob offset so theta=0 means bob is directly above cart
 rx = l * np.sin(theta0)
@@ -72,54 +69,21 @@ font = pygame.font.SysFont("Arial", 18)
 
 # Get the K matrix from the control module
 K = get_K(M, m, l, g)
-target_energy = get_target_energy(m, g, l)
-
-# Define hardware limits
-max_motor_force = 50.0  # The max force your steppers can handle without skipping
-energy_threshold = 300  # How close to E_target before we ease off the throttle
+target_energy = get_target_energy(m, l, g)
 
 # Define Deadzone +-5degs from the linear regime limit to avoid fast switching
 linear_regime = np.deg2rad(15)
+deadzone = np.deg2rad(5)
 linear = False
 energy = True
 if abs(theta0) < linear_regime:
     linear = True
     energy = False
 
-# Blending mechanic for the handoff from swing up to LQR controll
-time = 1e-3 # 100ms
-frames = time * FPS # s * frames / s --> frames
-
-def get_blended_force(theta, u_swing, u_lqr):
-    # Define your window (in radians)
-    # e.g., 20 degrees for the outer edge, 5 degrees for full LQR
-    outer_limit = np.deg2rad(20)  # ~20 degrees
-    inner_limit = np.deg2rad(5)  # ~5 degrees
-
-    # print(u_lqr, u_swing)
-    
-    print(theta)
-    abs_theta = abs(theta)
-
-    if abs_theta > outer_limit:
-        # Too far away, just swing up
-        w = 0.0
-    elif abs_theta < inner_limit:
-        # Close enough, full LQR
-        w = 1.0
-    else:
-        # Linear interpolation between the two
-        # (outer - current) / (outer - inner)
-        w = (outer_limit - abs_theta) / (outer_limit - inner_limit)
-
-    # The final control law
-    # print((1 - w) * u_swing + w * u_lqr)
-    return (1 - w) * u_swing + w * u_lqr
-
 
 # Instanciate the filters
 spike_killer = MedianFitler(window_size=5)
-smoother = EWMA(alpha=0.02) # closer to 0 gives more weight to old values
+smoother = EWMA(alpha=0.05) # closer to 0 gives more weight to old values
 force_arr = list()
 
 # Controller UI state
@@ -149,29 +113,14 @@ while running:
     space.step(dt)
 
     # compute pendulum angle theta (0 = upright)
-    # dx = cart.position.x - mass.position.x 
-    # dy = cart.position.y - mass.position.y
-    # theta = np.arctan2(dx, dy)# angle measured from upward vertical (radians)
-
-    r = cart.position - mass.position
-    # print(r.length)
-    theta = np.arctan2(r.x, r.y)
+    dx = cart.position.x - mass.position.x 
+    dy = cart.position.y - mass.position.y
+    theta = ( np.arctan2(dx, dy) )# angle measured from upward vertical (radians)
     # theta_continuous = ( theta + 2 * np.pi ) % ( 2 * np.pi )# angle measured from upward vertical (radians)
 
-    # angle wrapping to prevent discountinuities
-    theta_diff = theta - last_theta
-    if theta_diff > np.pi:
-        continuous_theta = theta - 2 * np.pi
-    elif theta_diff < -np.pi:
-        continuous_theta = theta + 2 * np.pi
-    else:
-        continuous_theta = theta
-
     # Compute linear and angular velocities
-    omega = (continuous_theta - last_theta) / dt
+    omega = (theta - last_theta) / dt
     v = (cart.position.x - last_x) / dt
-    arr.append(omega)
-    # print(cummulative_correction)
 
     last_x = cart.position.x
     last_theta = theta
@@ -179,16 +128,60 @@ while running:
     # Define the state vector with numerical values
     x = np.array([cart.position.x - (WIDTH//2), v, theta, omega])
 
-    current_energy = get_energy(cart.position.x, v, theta, omega, M, m, l, g)
-    # current_energy = current_energy if current_energy < 3 * target_energy else 0  
-    print(theta, current_energy, target_energy)
-
+    # print(x)
+    # Define hardware limits
+    max_motor_force = 50.0  # The max force your steppers can handle without skipping
+    energy_threshold = 500  # How close to E_target before we ease off the throttle
 
     # Compute the force F = - K . x (K matrix and state vector evaluated) and apply it on the cart
-    if abs(theta) < linear_regime:
-        F = calc_F_LQR(K, x)
-    else:
-        F = calc_F_swing(target_energy, current_energy, x, v, theta, omega, max_motor_force, energy_threshold)
+    if linear or (abs(theta) < linear_regime - deadzone):
+        linear = True
+        energy = False
+
+        F = - np.dot(K,x)
+        F = F[0]
+        # print("Linear regime")
+        # print(F)
+    elif energy or (linear and abs(theta) > linear_regime + deadzone):
+        energy = True
+        linear = False
+
+        current_energy = get_energy(cart.position.x, v, theta, omega, M, m, l, g)
+        E_err = current_energy - target_energy
+        # print(current_energy, target_energy, E_err)
+
+        # Calculate the raw pumping direction
+        pump_direction = np.sign(E_err * omega * np.cos(theta))
+
+        # Choose the Pumping Strategy based on current energy error
+        if abs(E_err) > energy_threshold:
+            # BANG-BANG MODE: We are far from the top. Pump with max safe force!
+            F = max_motor_force * pump_direction
+        else:
+            # PROPORTIONAL MODE: We are getting close. Ease off and finesse it.
+            # (Tune k_E so the transition from max_motor_force is smooth)
+            k_E = 0.01 
+            # print(1)
+            F = k_E * E_err * omega * np.cos(theta)
+
+        # Tune these three numbers based on your physical track length
+        k_p = 2.0  # Virtual spring stiffness (pulls back to x=0)
+        k_d = 10.0  # Virtual damping (prevents cart jitter)
+        # print(E_err)
+
+        F = F - (k_p * x) - (k_d * v)
+
+        
+
+        # energy = k_E * E_err * omega * np.cos(theta)
+        # spring = - (k_p * (cart.position.x - (WIDTH//2)))
+        # damping = - (k_d * v)  
+
+        # F = energy + spring + damping    
+        # print(energy, spring, damping)
+
+        
+        # print(F)
 
     # Ensure F is a scalar and clip to a safe maximum
     try:
@@ -196,12 +189,9 @@ while running:
     except Exception:
         F = float(np.array(F).flatten()[0])
 
-    # F = get_blended_force(theta, calc_F_swing(target_energy, current_energy, cart.position.x, v, theta, omega, max_motor_force, energy_threshold), calc_F_LQR(K, x))
     F = np.clip(F, -max_motor_force, max_motor_force)
-    # F = smoother.apply(spike_killer.apply(F))
+    F = smoother.apply(spike_killer.apply(F))
     force_arr.append(F)
-
-    # print(F)
 
     # Apply force only when controller is enabled
     if controller_enabled:
@@ -220,7 +210,7 @@ while running:
     label_surf = font.render(label, True, BUTTON_TEXT_COLOR)
     screen.blit(label_surf, (button_rect.x + 10, button_rect.y + 6))
 
-    info = f"cart_x={cart.position.x:.1f} cart_v={v:.1f} theta={continuous_theta:.3f} rad omega={omega:.3f} force={F:.3f}"
+    info = f"cart_x={cart.position.x:.1f} cart_v={v:.1f} theta={theta:.3f} rad omega={omega:.3f} force={F:.3f}"
     screen.blit(font.render(info, True, (220,220,220)), (8,8))
 
     pygame.display.flip()
@@ -231,9 +221,7 @@ pygame.quit()
 import matplotlib.pyplot as plt
 frames = np.arange(0,len(force_arr))
 force_arr = np.array(force_arr)
-arr = np.array(arr)
 plt.plot(frames, force_arr)
-plt.plot(frames, arr, '--')
 plt.xlabel("Frame number")
 plt.ylabel("Force (N)")
 plt.grid(True)
